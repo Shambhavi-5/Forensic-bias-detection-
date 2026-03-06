@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.csv
+*.pdf
+*.docx
+.streamlit/
+bias_model.pkl
