@@ -4,10 +4,6 @@ import pdfplumber
 import docx
 
 def extract_text(file_path: str) -> str:
-    """
-    Detects the file type based on extension, extracts text, 
-    cleans unnecessary whitespace, and returns the cleaned text.
-    """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
         
