@@ -5,7 +5,7 @@ from tempfile import NamedTemporaryFile
 
 # Import our custom NLP Pipeline logic
 from extract_text import extract_text
-from dataset_prep import sent_tokenize, analyze_sentence
+from dataset_prep import sent_tokenize, analyze_sentence, is_legal_citation
 from predict_bias import load_model, RISK_MAPPING
 
 # --- CONFIGURATION ---
@@ -50,7 +50,8 @@ def process_document(file_path: str, model):
             progress_bar.progress(min(i / total_sents, 1.0))
             
         sent_text = sent_text.strip()
-        if len(sent_text) < 15:
+        # Skip fragments and legal citation sentences (URLs, section refs, case numbers)
+        if len(sent_text) < 15 or is_legal_citation(sent_text):
             continue
             
         # Extract Linguistic Features
@@ -77,6 +78,7 @@ def process_document(file_path: str, model):
             report_data.append({
                 "Risk Level": risk_category,
                 "Confidence": f"{confidence:.1f}%",
+                "Bias Types": features.get("Bias_Types", "—"),
                 "Absolutes": features["Absolute_Count"],
                 "Subjectives": features["Subjective_Count"],
                 "Sentence Text": sent_text
@@ -131,12 +133,18 @@ if model:
             high_count = len(df_results[df_results['Risk Level'] == 'High Risk'])
             med_count = len(df_results[df_results['Risk Level'] == 'Medium Risk'])
             
-            # Display Metrcs
+            # Display Metrics
             st.subheader("📊 Document Risk Summary")
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric("Total Sentences Analyzed", total_sentences)
-            col2.metric("High Risk Sentences", high_count, delta_color="inverse")
-            col3.metric("Medium Risk Sentences", med_count, delta_color="off")
+            col2.metric("🔴 High Risk Sentences", high_count)
+            col3.metric("🟠 Medium Risk Sentences", med_count)
+            
+            # Bias type breakdown
+            if "Bias Types" in df_results.columns:
+                bias_counts = df_results["Bias Types"].str.split(", ").explode().value_counts()
+                top_bias = bias_counts.idxmax() if not bias_counts.empty else "None"
+                col4.metric("Top Bias Type", top_bias)
             
             st.divider()
             
@@ -156,8 +164,9 @@ if model:
             st.dataframe(
                 styled_df, 
                 use_container_width=True,
-                height=400,
+                height=450,
                 column_config={
+                    "Bias Types": st.column_config.TextColumn("Bias Types", width="medium"),
                     "Sentence Text": st.column_config.TextColumn("Sentence Text", width="large")
                 }
             )

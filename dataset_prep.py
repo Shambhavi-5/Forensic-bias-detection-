@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import pandas as pd
 import string
@@ -30,8 +31,82 @@ SUBJECTIVES = {
 HEDGES = {
     "might", "may", "could", "suggests", "appears", "seems", "possibly", 
     "probably", "likely", "unlikely", "indicates", "implies", "perhaps",
-    "tends", "assumes", "believes", "estimates"
+    "tends", "assumes", "believes", "estimates" , "maybe"
 }
+
+def is_legal_citation(sentence_text: str) -> bool:
+    """
+    Returns True if a sentence is predominantly a legal citation, URL,
+    section/law reference, or case number — not real prose worth analyzing.
+    """
+    text = sentence_text.strip()
+    
+    # Reject very short fragments
+    if len(text) < 15:
+        return True
+
+    # Reject sentences that are just URLs
+    if re.match(r'^https?://', text, re.IGNORECASE):
+        return True
+
+    # Reject Indian Kanoon / URL patterns embedded in text
+    if 'indiankanoon.org' in text.lower():
+        return True
+
+    # Tokenize into words to check composition
+    tokens = text.split()
+    total = len(tokens)
+    if total == 0:
+        return True
+
+    # Count tokens that look like: numbers, section refs, case IDs, legal codes
+    citation_tokens = 0
+    for tok in tokens:
+        # Pure numbers or numbers with punctuation  (e.g. "168", "421379")
+        if re.match(r'^[\d]+[.,/\-]?[\d]*$', tok):
+            citation_tokens += 1
+        # Section / article / clause references (e.g. "65B(4)", "S.168", "Art.21")
+        elif re.match(r'^(s\.|sec\.|section|art\.|article|clause|order|rule|para|sub-section)', tok, re.IGNORECASE):
+            citation_tokens += 1
+        # Case number patterns like "No.2/2024", "FAO-6160"
+        elif re.match(r'^[A-Z]{2,}[-/]\d', tok):
+            citation_tokens += 1
+        # Legal doc identifiers (e.g. "O&M", "DB", "SLP")
+        elif re.match(r'^\(?[A-Z&]{2,5}\)?$', tok):
+            citation_tokens += 1
+
+    # If more than 50% of the tokens look like citation fragments, skip it
+    if total > 0 and (citation_tokens / total) > 0.5:
+        return True
+
+    return False
+
+
+def get_bias_types(absolute_count: int, subjective_count: int, hedge_count: int, absolute_words: list, subjective_words: list) -> list:
+    """
+    Returns a list of specific bias type labels based on detected features.
+    - Overconfidence Bias: high use of absolute/definitive language with low hedging
+    - Emotional Framing Bias: use of charged, subjective adjectives
+    - Confirmation Bias (Anchoring): statement presented as fact without hedge
+    """
+    bias_types = []
+
+    if absolute_count > 0 and hedge_count == 0:
+        bias_types.append("Overconfidence Bias")
+    
+    if absolute_count > 0 and hedge_count > 0 and absolute_count > hedge_count:
+        bias_types.append("Anchoring Bias")
+
+    if subjective_count > 0:
+        bias_types.append("Emotional Framing Bias")
+
+    if absolute_count >= 2 and subjective_count == 0 and hedge_count == 0:
+        # Multiple absolutes with no subjectivity or hedging = confirmation bias pattern
+        if "Overconfidence Bias" not in bias_types:
+            bias_types.append("Confirmation Bias")
+
+    return bias_types if bias_types else ["Unspecified Risk"]
+
 
 def analyze_sentence(sentence_text):
     """
@@ -46,6 +121,8 @@ def analyze_sentence(sentence_text):
     hedge_count = 0
     first_person_count = 0
     word_count = 0
+    matched_absolutes = []
+    matched_subjectives = []
     
     # Tag parts of speech
     tagged_tokens = pos_tag(tokens)
@@ -61,27 +138,30 @@ def analyze_sentence(sentence_text):
         # Check against lexicons
         if word_lower in ABSOLUTES:
             absolute_count += 1
+            matched_absolutes.append(word_lower)
         elif word_lower in SUBJECTIVES:
             subjective_count += 1
+            matched_subjectives.append(word_lower)
         elif word_lower in HEDGES:
             hedge_count += 1
             
-        # First-person pronouns (I, me, my, mine, we, us, our)
-        # PRP = Personal Pronoun, PRP$ = Possessive Pronoun
+        # First-person pronouns (I, me, my, mine, we, us, our) — tracked but NOT scored
+        # (standard legal language uses "I have heard..." which is procedural, not bias)
         if pos in ("PRP", "PRP$") and word_lower in {"i", "me", "my", "mine", "we", "us", "our"}:
             first_person_count += 1
 
     # Calculate Hedge Ratio (Hedges per Absolute)
-    # A ratio < 1 means they use more definitives than hedges (overconfidence)
-    # A ratio > 1 means they are hedging heavily
     if absolute_count > 0:
         hedge_ratio = hedge_count / absolute_count
     else:
-        hedge_ratio = hedge_count # Treat 0 absolutes as a denominator of 1 for the ratio
+        hedge_ratio = hedge_count
         
-    # Total Bias Indicators Score (A simple aggregate for the MVP)
-    # We heavily penalize Subjectives and Absolutes. 
-    bias_score = (absolute_count * 2) + (subjective_count * 3) + first_person_count
+    # Bias Risk Score: Only penalize Absolutes and Subjectives
+    # First-person is tracked but NOT scored (too common in legal procedural language)
+    bias_score = (absolute_count * 2) + (subjective_count * 3)
+
+    # Determine specific bias types from the features
+    bias_types = get_bias_types(absolute_count, subjective_count, hedge_count, matched_absolutes, matched_subjectives)
         
     return {
         "Word_Count": word_count,
@@ -90,7 +170,8 @@ def analyze_sentence(sentence_text):
         "Hedge_Count": hedge_count,
         "Hedge_Ratio": round(hedge_ratio, 2),
         "First_Person_Count": first_person_count,
-        "Bias_Risk_Score": bias_score
+        "Bias_Risk_Score": bias_score,
+        "Bias_Types": ", ".join(bias_types)
     }
 
 def process_report(text: str, document_name: str) -> list:
@@ -106,8 +187,8 @@ def process_report(text: str, document_name: str) -> list:
     for i, sent_text in enumerate(sentences):
         sent_text = sent_text.strip()
         
-        # Skip empty or tiny sentences (e.g. just a number, abbreviation, or artifact)
-        if len(sent_text) < 15:
+        # Skip empty, tiny, or legal citation sentences
+        if len(sent_text) < 15 or is_legal_citation(sent_text):
             continue
             
         features = analyze_sentence(sent_text)
