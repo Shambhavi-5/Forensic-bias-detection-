@@ -32,7 +32,8 @@ def train_model(dataset_path: str, model_output_path: str):
     # 2. Select Features (X)
     # We drop identifying/text columns and the original score we are trying to predict
     features = ['Word_Count', 'Absolute_Count', 'Subjective_Count', 
-                'Hedge_Count', 'Hedge_Ratio', 'First_Person_Count']
+                'Hedge_Count', 'Hedge_Ratio', 'First_Person_Count',
+                'Contextual_Density', 'Contextual_Momentum', 'Is_Opinion']
                 
     X = df[features]
     y = df['Risk_Category']

@@ -17,7 +17,16 @@ ABSOLUTES = {
     "always", "never", "undoubtedly", "obviously", "certainly",
     "conclusively", "impossible", "clearly", "unquestionably",
     "irrefutable", "definite", "must", "proven", "proves",
-    "unanimously", "absolute", "entirely", "completely"
+    "unanimously", "absolute", "entirely", "completely",
+    "certain", "sure", "conclusive", "indisputable", "evident", "plainly"
+}
+
+# 2. Indicators of Procedural/Statutory Language (used to neutralize false positives)
+PROCURAL_MARKERS = {
+    "filed", "prescribed", "requirement", "compliance", "statutory", "administrative",
+    "regulation", "provision", "procedure", "deadline", "certified", "mandated",
+    "stipulated", "directed", "period", "days", "months", "section", "article",
+    "rule", "code", "interpretation", "interpreted"
 }
 
 # 2. Emotional / Subjective Adjectives & Adverbs
@@ -33,6 +42,20 @@ HEDGES = {
     "might", "may", "could", "suggests", "appears", "seems", "possibly",
     "probably", "likely", "unlikely", "indicates", "implies", "perhaps",
     "tends", "assumes", "believes", "estimates", "maybe"
+}
+
+# 3. Opinion-signaling verbs (Expert Opinion / Subjectivity)
+OPINION_VERBS = {
+    "believe", "think", "opine", "guess", "assume", "conclude", "seem", 
+    "seems", "appears", "appeared", "suggests", "suggested", "feel", 
+    "feels", "wonder", "estimate", "estimated", "speculate", "speculated"
+}
+
+# 4. Fact-signaling verbs (Objective Reporting)
+FACT_VERBS = {
+    "found", "found", "observed", "recorded", "noted", "seen", "noted", 
+    "conducted", "stated", "perused", "heard", "detailed", "documented",
+    "recovered", "seized", "collected", "prepared", "submitted"
 }
 
 # --- Edge Case Helper Patterns ---
@@ -162,6 +185,43 @@ def get_bias_types(absolute_count: int, subjective_count: int, hedge_count: int,
     return bias_types if bias_types else ["Unspecified Risk"]
 
 
+def get_statement_nature(tokens: list, tagged_tokens: list, absolute_count: int, 
+                         subjective_count: int, first_person_count: int) -> str:
+    """
+    Classifies the sentence as 'Opinion', 'Fact', or 'Procedural'.
+    Logic:
+    - Opinion: High 1st person + opinion verbs OR high subjective word density.
+    - Procedural: Presence of PROCURAL_MARKERS or specific formulaic phrases.
+    - Fact: Dominated by Fact verbs, past tense, and low subjectivity.
+    """
+    text_lower = " ".join(tokens).lower()
+    
+    has_opinion_verb = any(t in OPINION_VERBS for t in tokens)
+    has_fact_verb = any(t in FACT_VERBS for t in tokens)
+    
+    # 1. Procedural Check (highest priority)
+    procedural_terms = {"heard", "perused", "submissions", "counsel", "learned", "case file"}
+    if any(term in text_lower for term in procedural_terms) or \
+       any(m in text_lower for m in PROCURAL_MARKERS):
+        return "Procedural"
+
+    # 2. Opinion Check
+    # "In my opinion", "I believe", "it appears"
+    if has_opinion_verb or (first_person_count > 0 and not has_fact_verb):
+        return "Opinion"
+    
+    # High adjective/adverb density often indicates opinion framing
+    if (absolute_count + subjective_count) >= 2:
+        return "Opinion"
+
+    # 3. Fact Check
+    if has_fact_verb:
+        return "Fact"
+
+    # Default to Fact for neutral technical reporting
+    return "Fact"
+
+
 # =============================================================================
 # MAIN SENTENCE ANALYZER
 # =============================================================================
@@ -202,7 +262,12 @@ def analyze_sentence(sentence_text: str) -> dict:
         word_lower = token.lower()
         word_count += 1
 
-        # Step 4: Negation check — look back 1-2 tokens for negation words
+        # Step 4: Procedural Neutralizer
+        # If absolute words like 'must' or 'absolute' appear near legal markers (Section, Rule, filed),
+        # they are likely procedural/statutory rather than subjective overconfidence.
+        is_procedural_context = any(m in analysis_text.lower() for m in PROCURAL_MARKERS)
+        
+        # Step 5: Negation check — look back 1-2 tokens for negation words
         preceding_words = [
             tagged_tokens[i][0].lower()
             for i in range(max(0, idx - 2), idx)
@@ -210,8 +275,14 @@ def analyze_sentence(sentence_text: str) -> dict:
         ]
         is_negated = any(w in NEGATION_WORDS for w in preceding_words)
 
-        # Check against lexicons — skip if this word is negated
+        # Check against lexicons
+        # Neutralizer: 'must' is only a bias if it's not in a procedural context
         if word_lower in ABSOLUTES and not is_negated:
+            if word_lower == "must" and is_procedural_context:
+                continue # Skip neutral procedural 'must'
+            if word_lower == "absolute" and ("liability" in analysis_text.lower() or "privilege" in analysis_text.lower()):
+                continue # Skip legal terms of art
+                
             absolute_count += 1
             matched_absolutes.append(word_lower)
         elif word_lower in SUBJECTIVES and not is_negated:
@@ -240,6 +311,11 @@ def analyze_sentence(sentence_text: str) -> dict:
     elif context_penalty == 0.5 and raw_score > 0:
         bias_types = [b + " (Attributed)" for b in bias_types]
 
+    # Step 8: Differentiate Fact vs. Opinion
+    statement_nature = get_statement_nature(tokens, tagged_tokens, absolute_count, 
+                                          subjective_count, first_person_count)
+    is_opinion = 1 if statement_nature == "Opinion" else 0
+
     return {
         "Word_Count": word_count,
         "Absolute_Count": absolute_count,
@@ -248,7 +324,41 @@ def analyze_sentence(sentence_text: str) -> dict:
         "Hedge_Ratio": round(hedge_ratio, 2),
         "First_Person_Count": first_person_count,
         "Bias_Risk_Score": bias_score,
-        "Bias_Types": ", ".join(bias_types)
+        "Bias_Types": ", ".join(bias_types),
+        "Key_Triggers": ", ".join(list(set(matched_absolutes + matched_subjectives))),
+        "Statement_Nature": statement_nature,
+        "Is_Opinion": is_opinion
+    }
+
+def is_definition_sentence(text: str) -> bool:
+    """Detects if a sentence is just a definition, which shouldn't be flagged as bias."""
+    low_text = text.lower()
+    patterns = [
+        r"^the term .* means",
+        r"^definition of .* is",
+        r"^.* shall mean",
+        r"^expressions? .* includes?"
+    ]
+    return any(re.search(p, low_text) for p in patterns)
+
+
+def get_contextual_metrics(window_features: list) -> dict:
+    """
+    Calculates metrics across a window of analyzed sentences.
+    - Contextual_Density: Avg bias score in the window.
+    - Contextual_Momentum: Difference in scores (detects escalating bias).
+    """
+    scores = [f["Bias_Risk_Score"] for f in window_features]
+    
+    # Average score in the local neighborhood
+    density = sum(scores) / len(scores) if scores else 0
+    
+    # Momentum: is the bias increasing? (last - first)
+    momentum = scores[-1] - scores[0] if len(scores) > 1 else 0
+    
+    return {
+        "Contextual_Density": round(density, 2),
+        "Contextual_Momentum": momentum
     }
 
 
@@ -258,27 +368,47 @@ def analyze_sentence(sentence_text: str) -> dict:
 
 def process_report(text: str, document_name: str) -> list:
     """
-    Processes the full text of one report.
-    Returns a list of dicts, one per valid sentence.
+    Processes the full text of one report using a sliding window (size=3)
+    to provide contextual awareness.
     """
     sentences = sent_tokenize(text)
-    sentence_data = []
-
+    
+    # Filter out empty/citations first to maintain sequence integrity
+    valid_sentences = []
     for i, sent_text in enumerate(sentences):
         sent_text = sent_text.strip()
 
-        # Skip empty, tiny, or legal citation sentences
-        if len(sent_text) < 15 or is_legal_citation(sent_text):
+        # Skip empty, tiny, legal citations, or definition sentences
+        if len(sent_text) < 15 or is_legal_citation(sent_text) or is_definition_sentence(sent_text):
             continue
-
-        features = analyze_sentence(sent_text)
-
+        valid_sentences.append(sent_text)
+            
+    # Analyze all sentences first to gather features
+    analyzed_list = [analyze_sentence(s) for s in valid_sentences]
+    
+    sentence_data = []
+    window_size = 3
+    
+    for i in range(len(valid_sentences)):
+        # Define window (previous, current, next)
+        start_idx = max(0, i - window_size // 2)
+        end_idx = min(len(valid_sentences), i + window_size // 2 + 1)
+        window_features = analyzed_list[start_idx:end_idx]
+        
+        # Calculate contextual metrics
+        context_metrics = get_contextual_metrics(window_features)
+        
+        # Build combined row
+        current_features = analyzed_list[i]
         row = {
             "Document": document_name,
             "Sentence_ID": i + 1,
-            "Sentence_Text": sent_text
+            "Sentence_Text": valid_sentences[i],
+            "Context_Snippet": " | ".join(valid_sentences[start_idx:end_idx])
         }
-        row.update(features)
+        row.update(current_features)
+        row.update(context_metrics)
+        
         sentence_data.append(row)
 
     return sentence_data

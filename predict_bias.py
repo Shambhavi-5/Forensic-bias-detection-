@@ -16,29 +16,32 @@ def load_model(model_path: str):
     except FileNotFoundError:
         raise FileNotFoundError(f"Model not found at {model_path}. Did you run model_training.py first?")
 
-def predict_bias_risk(sentence: str, model) -> dict:
+def predict_bias_risk(sentence: str, model, context_density: float = 0.0, context_momentum: float = 0.0) -> dict:
     """
-    Takes a raw string sentence, extracts NLP features, and predicts
-    its bias risk category using the trained model.
+    Takes a raw string sentence, extracts isolation features, and combined with 
+    provided context, predicts the bias risk category.
     """
-    # 1. Extract linguistic features using the exact same logic used during training
+    # 1. Extract linguistic features in isolation
     features = analyze_sentence(sentence)
     
-    # The model was trained on ('Word_Count', 'Absolute_Count', 'Subjective_Count', 
-    # 'Hedge_Count', 'Hedge_Ratio', 'First_Person_Count')
-    # So we must provide a DataFrame matching that exact order
-    
+    # Combined feature list for the model (9 features)
     feature_list = [
         features["Word_Count"],
         features["Absolute_Count"],
         features["Subjective_Count"],
         features["Hedge_Count"],
         features["Hedge_Ratio"],
-        features["First_Person_Count"]
+        features["First_Person_Count"],
+        context_density,
+        context_momentum,
+        features["Is_Opinion"]
     ]
     
-    columns = ['Word_Count', 'Absolute_Count', 'Subjective_Count', 
-               'Hedge_Count', 'Hedge_Ratio', 'First_Person_Count']
+    columns = [
+        'Word_Count', 'Absolute_Count', 'Subjective_Count', 
+        'Hedge_Count', 'Hedge_Ratio', 'First_Person_Count',
+        'Contextual_Density', 'Contextual_Momentum', 'Is_Opinion'
+    ]
                
     X_new = pd.DataFrame([feature_list], columns=columns)
     
@@ -53,10 +56,13 @@ def predict_bias_risk(sentence: str, model) -> dict:
         "Sentence": sentence,
         "Risk_Category": RISK_MAPPING[prediction],
         "Confidence": f"{confidence:.1f}%",
+        "Nature": features["Statement_Nature"],
         "Extracted_Features": {
             "Absolutes": features["Absolute_Count"],
             "Subjectives": features["Subjective_Count"],
-            "Hedges": features["Hedge_Count"]
+            "Hedges": features["Hedge_Count"],
+            "Density": context_density,
+            "Is_Opinion": features["Is_Opinion"]
         }
     }
 

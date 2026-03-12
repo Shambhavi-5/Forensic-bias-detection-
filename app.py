@@ -5,7 +5,7 @@ from tempfile import NamedTemporaryFile
 
 # Import our custom NLP Pipeline logic
 from extract_text import extract_text
-from dataset_prep import sent_tokenize, analyze_sentence, is_legal_citation
+from dataset_prep import sent_tokenize, analyze_sentence, is_legal_citation, get_contextual_metrics
 from predict_bias import load_model, RISK_MAPPING
 
 # --- CONFIGURATION ---
@@ -27,7 +27,7 @@ def get_model():
         return None
 
 def process_document(file_path: str, model):
-    """Runs the full NLP inference pipeline on a document and returns the dataframe."""
+    """Runs the full NLP inference pipeline with contextual awareness."""
     
     # 1. Extract Text
     try:
@@ -36,55 +36,84 @@ def process_document(file_path: str, model):
         st.error(f"Text extraction failed: {e}")
         return pd.DataFrame(), 0
         
-    # 2. Tokenize into sentences
-    sentences = sent_tokenize(raw_text)
+    # 2. Tokenize and filter sentences
+    raw_sentences = sent_tokenize(raw_text)
+    valid_sentences = []
+    for s in raw_sentences:
+        s = s.strip()
+        if len(s) >= 15 and not is_legal_citation(s):
+            valid_sentences.append(s)
+    
+    if not valid_sentences:
+        return pd.DataFrame(), 0
+
+    # 3. Step 1: Analyze ALL sentences for isolated features
+    progress_bar = st.progress(0, text="Analyzing isolated linguistic features...")
+    analyzed_list = []
+    for i, sent in enumerate(valid_sentences):
+        analyzed_list.append(analyze_sentence(sent))
+        if i % 10 == 0:
+            progress_bar.progress(min(i / len(valid_sentences), 1.0))
+
+    # 4. Step 2: Contextual Analysis & ML Inference
     report_data = []
+    total_sents = len(valid_sentences)
+    window_size = 3
     
-    # 3. Analyze each sentence
-    progress_bar = st.progress(0)
-    total_sents = len(sentences)
-    
-    for i, sent_text in enumerate(sentences):
-        # Update progress bar
+    progress_bar.progress(0, text="Calculating contextual bias density and momentum...")
+    for i in range(total_sents):
         if i % 10 == 0:
             progress_bar.progress(min(i / total_sents, 1.0))
             
-        sent_text = sent_text.strip()
-        # Skip fragments and legal citation sentences (URLs, section refs, case numbers)
-        if len(sent_text) < 15 or is_legal_citation(sent_text):
-            continue
-            
-        # Extract Linguistic Features
-        features = analyze_sentence(sent_text)
+        # Define window
+        start_idx = max(0, i - window_size // 2)
+        end_idx = min(total_sents, i + window_size // 2 + 1)
+        window_features = analyzed_list[start_idx:end_idx]
         
+        # Get contextual signals
+        context_metrics = get_contextual_metrics(window_features)
+        current_features = analyzed_list[i]
+        
+        # Combine all 9 features for the model
         feature_list = [
-            features["Word_Count"],
-            features["Absolute_Count"],
-            features["Subjective_Count"],
-            features["Hedge_Count"],
-            features["Hedge_Ratio"],
-            features["First_Person_Count"]
+            current_features["Word_Count"],
+            current_features["Absolute_Count"],
+            current_features["Subjective_Count"],
+            current_features["Hedge_Count"],
+            current_features["Hedge_Ratio"],
+            current_features["First_Person_Count"],
+            context_metrics["Contextual_Density"],
+            context_metrics["Contextual_Momentum"],
+            current_features["Is_Opinion"]
+        ]
+        
+        feature_columns = [
+            'Word_Count', 'Absolute_Count', 'Subjective_Count', 
+            'Hedge_Count', 'Hedge_Ratio', 'First_Person_Count',
+            'Contextual_Density', 'Contextual_Momentum', 'Is_Opinion'
         ]
         
         # ML Inference
-        X_new = pd.DataFrame([feature_list], columns=['Word_Count', 'Absolute_Count', 'Subjective_Count', 'Hedge_Count', 'Hedge_Ratio', 'First_Person_Count'])
+        X_new = pd.DataFrame([feature_list], columns=feature_columns)
         prediction = model.predict(X_new)[0]
         confidence = model.predict_proba(X_new)[0][prediction] * 100
         
         risk_category = RISK_MAPPING[prediction]
         
-        # Only log Medium & High risk items to avoid cluttering the UI
         if risk_category in ("High Risk", "Medium Risk"):
+            snippet = " | ".join(valid_sentences[start_idx:end_idx])
             report_data.append({
                 "Risk Level": risk_category,
+                "Nature": current_features.get("Statement_Nature", "Fact"),
                 "Confidence": f"{confidence:.1f}%",
-                "Bias Types": features.get("Bias_Types", "—"),
-                "Absolutes": features["Absolute_Count"],
-                "Subjectives": features["Subjective_Count"],
-                "Sentence Text": sent_text
+                "Bias Types": current_features.get("Bias_Types", "—"),
+                "Density": context_metrics["Contextual_Density"],
+                "Key Triggers": current_features.get("Key_Triggers", "—"),
+                "Sentence Text": valid_sentences[i],
+                "Context Snippet": snippet
             })
             
-    progress_bar.progress(1.0)
+    progress_bar.progress(1.0, text="Analysis complete!")
     
     df = pd.DataFrame(report_data)
     
@@ -94,7 +123,7 @@ def process_document(file_path: str, model):
         df = df.sort_values(by=['Sort_Val', 'Confidence'], ascending=[False, False])
         df = df.drop(columns=['Sort_Val'])
         
-    return df, total_sents
+    return df, len(raw_sentences)
 
 # --- UI LAYOUT ---
 st.title("⚖️ Cognitive Bias Risk Detector")
@@ -140,6 +169,10 @@ if model:
             col2.metric("🔴 High Risk Sentences", high_count)
             col3.metric("🟠 Medium Risk Sentences", med_count)
             
+            # Opinion Count
+            opinion_count = len(df_results[df_results['Nature'] == 'Opinion'])
+            col4.metric("📝 Subjective Opinions", opinion_count)
+            
             # Bias type breakdown
             if "Bias Types" in df_results.columns:
                 bias_counts = df_results["Bias Types"].str.split(", ").explode().value_counts()
@@ -164,10 +197,15 @@ if model:
             st.dataframe(
                 styled_df, 
                 use_container_width=True,
-                height=450,
+                height=500,
                 column_config={
+                    "Risk Level": st.column_config.TextColumn("Risk", width="small"),
+                    "Nature": st.column_config.TextColumn("Nature", width="small"),
+                    "Confidence": st.column_config.TextColumn("Confidence", width="small"),
                     "Bias Types": st.column_config.TextColumn("Bias Types", width="medium"),
-                    "Sentence Text": st.column_config.TextColumn("Sentence Text", width="large")
+                    "Key Triggers": st.column_config.TextColumn("Key Triggers", width="medium"),
+                    "Sentence Text": st.column_config.TextColumn("Sentence Text", width="large"),
+                    "Context Snippet": st.column_config.TextColumn("Context Snippet", width="large")
                 }
             )
             
